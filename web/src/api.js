@@ -20,7 +20,16 @@ export const getSamples = (id) => api.get(`/sessions/${id}/samples`)
 export const getSummary = (id) => api.get(`/sessions/${id}/summary`)
 export const injectSample = (id, data) => api.post(`/sessions/${id}/samples`, data)
 
+// 帧时间分析
+export const getFrameAnalysis = (id) => api.get(`/sessions/${id}/frame-analysis`)
+
+// 系统信息
+export const getSystemInfo = (id) => api.get(`/sessions/${id}/system`)
+
 // 对比分析
 export const compareSessions = (ids) => api.get(`/compare?ids=${ids.join(',')}`)
+
+// 服务器信息
+export const getServerInfo = () => api.get('/info')
 
 export default api

@@ -1,7 +1,9 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
+	"runtime"
 	"strings"
 	"time"
 
@@ -14,15 +16,17 @@ import (
 )
 
 type Server struct {
-	db         *db.DB
-	collectors map[string]*collector.Collector
-	engine     *gin.Engine
+	db             *db.DB
+	collectors     map[string]*collector.Collector
+	presentMonCols map[string]*collector.PresentMonCollector
+	engine         *gin.Engine
 }
 
 func NewServer(database *db.DB) *Server {
 	s := &Server{
-		db:         database,
-		collectors: make(map[string]*collector.Collector),
+		db:             database,
+		collectors:     make(map[string]*collector.Collector),
+		presentMonCols: make(map[string]*collector.PresentMonCollector),
 	}
 
 	gin.SetMode(gin.ReleaseMode)
@@ -38,19 +42,33 @@ func NewServer(database *db.DB) *Server {
 
 	api := r.Group("/api")
 	{
+		// Session 管理
 		api.POST("/sessions", s.createSession)
 		api.GET("/sessions", s.listSessions)
 		api.GET("/sessions/:id", s.getSession)
 		api.POST("/sessions/:id/start", s.startCollect)
 		api.POST("/sessions/:id/stop", s.stopCollect)
 		api.DELETE("/sessions/:id", s.deleteSession)
+
+		// 数据查询
 		api.GET("/sessions/:id/samples", s.getSamples)
 		api.GET("/sessions/:id/summary", s.getSummary)
 		api.POST("/sessions/:id/samples", s.injectSample)
+
+		// 帧时间分析
+		api.GET("/sessions/:id/frame-analysis", s.getFrameAnalysis)
+
+		// 系统信息
+		api.GET("/sessions/:id/system", s.getSystemInfo)
+
+		// 对比
 		api.GET("/compare", s.compare)
+
+		// 运行时信息
+		api.GET("/info", s.getServerInfo)
 	}
 
-	// 静态文件 — 前端 build 后嵌入
+	// 静态文件
 	r.Static("/assets", "./web/dist/assets")
 	r.NoRoute(func(c *gin.Context) {
 		c.File("./web/dist/index.html")
@@ -62,6 +80,7 @@ func NewServer(database *db.DB) *Server {
 
 func (s *Server) Run(addr string) error {
 	fmt.Printf("[server] 启动 http://%s\n", addr)
+	fmt.Printf("[server] OS=%s Arch=%s\n", runtime.GOOS, runtime.GOARCH)
 	return s.engine.Run(addr)
 }
 
@@ -69,8 +88,11 @@ func (s *Server) Run(addr string) error {
 
 func (s *Server) createSession(c *gin.Context) {
 	var req struct {
-		Name    string `json:"name"`
-		Process string `json:"process"`
+		Name     string `json:"name"`
+		Process  string `json:"process"`
+		PID      int    `json:"pid"`
+		Interval string `json:"interval"`
+		Tags     string `json:"tags"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -81,8 +103,11 @@ func (s *Server) createSession(c *gin.Context) {
 		ID:        generateID(),
 		Name:      req.Name,
 		Process:   req.Process,
+		PID:       int32(req.PID),
 		Status:    "created",
 		StartTime: time.Now(),
+		Interval:  req.Interval,
+		Tags:      req.Tags,
 	}
 
 	if err := s.db.CreateSession(session); err != nil {
@@ -123,12 +148,19 @@ func (s *Server) startCollect(c *gin.Context) {
 	}
 
 	var req struct {
-		PID      int    `json:"pid"`
-		Interval string `json:"interval"` // e.g. "1s", "500ms"
+		PID             int    `json:"pid"`
+		Interval        string `json:"interval"`
+		PresentMonPath  string `json:"presentmon_path"`
+		EnablePresentMon bool  `json:"enable_presentmon"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+
+	pid := int32(req.PID)
+	if pid == 0 {
+		pid = session.PID
 	}
 
 	interval := time.Second
@@ -138,7 +170,7 @@ func (s *Server) startCollect(c *gin.Context) {
 		}
 	}
 
-	coll, err := collector.New(s.db, int32(req.PID), interval)
+	coll, err := collector.New(s.db, pid, interval)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -146,10 +178,26 @@ func (s *Server) startCollect(c *gin.Context) {
 
 	s.collectors[id] = coll
 	session.Status = "running"
-	session.StartTime = time.Now()
-	s.db.CreateSession(session)
+	session.PID = pid
+	session.Interval = req.Interval
 
+	// 启动性能采集
 	go coll.Start(id)
+
+	// 启动 PresentMon（可选）
+	if req.EnablePresentMon {
+		pmPath := req.PresentMonPath
+		if pmPath == "" {
+			pmPath, _ = collector.CheckPresentMon()
+		}
+		if pmPath != "" {
+			pmColl, err := collector.NewPresentMonCollector(s.db, id, pid, pmPath)
+			if err == nil {
+				s.presentMonCols[id] = pmColl
+				go pmColl.StartPresentMon(pmPath)
+			}
+		}
+	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "running", "session": session})
 }
@@ -160,6 +208,10 @@ func (s *Server) stopCollect(c *gin.Context) {
 	if coll, ok := s.collectors[id]; ok {
 		coll.Stop()
 		delete(s.collectors, id)
+	}
+	if pm, ok := s.presentMonCols[id]; ok {
+		pm.Stop()
+		delete(s.presentMonCols, id)
 	}
 
 	if err := s.db.StopSession(id); err != nil {
@@ -175,6 +227,10 @@ func (s *Server) deleteSession(c *gin.Context) {
 	if coll, ok := s.collectors[id]; ok {
 		coll.Stop()
 		delete(s.collectors, id)
+	}
+	if pm, ok := s.presentMonCols[id]; ok {
+		pm.Stop()
+		delete(s.presentMonCols, id)
 	}
 	if err := s.db.DeleteSession(id); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -223,6 +279,24 @@ func (s *Server) injectSample(c *gin.Context) {
 	c.JSON(http.StatusCreated, sample)
 }
 
+func (s *Server) getFrameAnalysis(c *gin.Context) {
+	analysis, err := s.db.GetFrameTimeAnalysis(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, analysis)
+}
+
+func (s *Server) getSystemInfo(c *gin.Context) {
+	info, err := s.db.GetSystemInfo(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "system info not found"})
+		return
+	}
+	c.JSON(http.StatusOK, info)
+}
+
 func (s *Server) compare(c *gin.Context) {
 	idsStr := c.Query("ids")
 	if idsStr == "" {
@@ -242,6 +316,25 @@ func (s *Server) compare(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, result)
+}
+
+func (s *Server) getServerInfo(c *gin.Context) {
+	gpuStatus := "none"
+	pmStatus := "not available"
+
+	// 检查 nvidia-smi
+	if path, err := collector.New(s.db, 0, time.Second).CheckPresentMon(); err == nil {
+		_ = path
+	}
+	_ = gpuStatus
+	_ = pmStatus
+
+	c.JSON(http.StatusOK, gin.H{
+		"os":       runtime.GOOS,
+		"arch":     runtime.GOARCH,
+		"version":  "1.1.0",
+		"features": []string{"cpu", "memory", "threads", "disk_io", "network_io", "gpu_nvidia", "frametime", "jank_detection", "presentmon"},
+	})
 }
 
 func generateID() string {
