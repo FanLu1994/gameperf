@@ -1,0 +1,19 @@
+# 数据目录
+data/
+
+# Go
+gameperf
+*.exe
+
+# Node
+web/node_modules/
+web/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
