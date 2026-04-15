@@ -19,6 +19,7 @@ type Server struct {
 	db             *db.DB
 	collectors     map[string]*collector.Collector
 	androidCols    map[string]*collector.AndroidCollector
+	iosCols        map[string]*collector.IOSCollector
 	presentMonCols map[string]*collector.PresentMonCollector
 	engine         *gin.Engine
 }
@@ -28,6 +29,7 @@ func NewServer(database *db.DB) *Server {
 		db:             database,
 		collectors:     make(map[string]*collector.Collector),
 		androidCols:    make(map[string]*collector.AndroidCollector),
+		iosCols:        make(map[string]*collector.IOSCollector),
 		presentMonCols: make(map[string]*collector.PresentMonCollector),
 	}
 
@@ -60,6 +62,10 @@ func NewServer(database *db.DB) *Server {
 		// Android 专用
 		api.GET("/android/devices", s.listAndroidDevices)
 		api.GET("/android/packages", s.listAndroidPackages)
+		// iOS 专用
+		api.GET("/ios/devices", s.listIOSDevices)
+		api.GET("/ios/apps", s.listIOSApps)
+		api.GET("/ios/check", s.checkIOSPrereqs)
 	}
 
 	r.Static("/assets", "./web/dist/assets")
@@ -198,6 +204,29 @@ func (s *Server) startCollect(c *gin.Context) {
 			}
 		}()
 
+	case "ios":
+		bundle := session.Package
+		if bundle == "" { bundle = req.Package }
+		udid := session.DeviceID
+		if udid == "" { udid = req.DeviceID }
+
+		if bundle == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "bundle ID required for ios"})
+			return
+		}
+
+		ic := collector.NewIOSCollector(s.db, bundle, udid, interval)
+		s.iosCols[id] = ic
+		session.Status = "running"
+		session.Package = bundle
+		session.DeviceID = udid
+
+		go func() {
+			if err := ic.Start(id); err != nil {
+				fmt.Printf("[ios] 启动失败: %v\n", err)
+			}
+		}()
+
 	default: // windows / linux
 		pid := int32(req.PID)
 		if pid == 0 { pid = session.PID }
@@ -232,6 +261,7 @@ func (s *Server) stopCollect(c *gin.Context) {
 	id := c.Param("id")
 	if coll, ok := s.collectors[id]; ok { coll.Stop(); delete(s.collectors, id) }
 	if ac, ok := s.androidCols[id]; ok { ac.Stop(); delete(s.androidCols, id) }
+	if ic, ok := s.iosCols[id]; ok { ic.Stop(); delete(s.iosCols, id) }
 	if pm, ok := s.presentMonCols[id]; ok { pm.Stop(); delete(s.presentMonCols, id) }
 	s.db.StopSession(id)
 	c.JSON(http.StatusOK, gin.H{"status": "stopped"})
@@ -241,6 +271,7 @@ func (s *Server) deleteSession(c *gin.Context) {
 	id := c.Param("id")
 	if coll, ok := s.collectors[id]; ok { coll.Stop(); delete(s.collectors, id) }
 	if ac, ok := s.androidCols[id]; ok { ac.Stop(); delete(s.androidCols, id) }
+	if ic, ok := s.iosCols[id]; ok { ic.Stop(); delete(s.iosCols, id) }
 	if pm, ok := s.presentMonCols[id]; ok { pm.Stop(); delete(s.presentMonCols, id) }
 	s.db.DeleteSession(id)
 	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
@@ -294,11 +325,11 @@ func (s *Server) compare(c *gin.Context) {
 
 func (s *Server) getServerInfo(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"os":       runtime.GOOS,
-		"arch":     runtime.GOARCH,
-		"version":  "2.0.0",
-		"platforms": []string{"windows", "linux", "android"},
-		"features": []string{"cpu", "memory", "gpu_adreno", "gpu_mali", "gpu_nvidia", "fps", "frametime", "jank", "disk_io", "network_io", "battery", "thermal", "presentmon"},
+		"os":        runtime.GOOS,
+		"arch":      runtime.GOARCH,
+		"version":   "2.0.0",
+		"platforms": []string{"windows", "linux", "android", "ios"},
+		"features":  []string{"cpu", "memory", "gpu_adreno", "gpu_mali", "gpu_nvidia", "fps", "frametime", "jank", "disk_io", "network_io", "battery", "thermal", "presentmon", "ios_instruments"},
 	})
 }
 
@@ -323,6 +354,38 @@ func (s *Server) listAndroidPackages(c *gin.Context) {
 	}
 	if packages == nil { packages = []string{} }
 	c.JSON(http.StatusOK, gin.H{"packages": packages})
+}
+
+// --- iOS 专用 API ---
+
+func (s *Server) listIOSDevices(c *gin.Context) {
+	devices, err := collector.ListIOSDevices()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "pymobiledevice3 not available: " + err.Error()})
+		return
+	}
+	if devices == nil { devices = []map[string]interface{}{} }
+	c.JSON(http.StatusOK, gin.H{"devices": devices})
+}
+
+func (s *Server) listIOSApps(c *gin.Context) {
+	udid := c.Query("device_id")
+	apps, err := collector.ListIOSApps(udid)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if apps == nil { apps = []string{} }
+	c.JSON(http.StatusOK, gin.H{"apps": apps})
+}
+
+func (s *Server) checkIOSPrereqs(c *gin.Context) {
+	path, err := collector.CheckIOSPrerequisites()
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"ready": false, "error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ready": true, "path": path})
 }
 
 func generateID() string {

@@ -20,4 +20,9 @@ export const getServerInfo = () => api.get('/info')
 export const listAndroidDevices = () => api.get('/android/devices')
 export const listAndroidPackages = (deviceId) => api.get(`/android/packages${deviceId ? '?device_id=' + deviceId : ''}`)
 
+// iOS
+export const checkIOSPrereqs = () => api.get('/ios/check')
+export const listIOSDevicesAPI = () => api.get('/ios/devices')
+export const listIOSAppsAPI = (deviceId) => api.get(`/ios/apps${deviceId ? '?device_id=' + deviceId : ''}`)
+
 export default api
