@@ -18,6 +18,7 @@ import (
 type Server struct {
 	db             *db.DB
 	collectors     map[string]*collector.Collector
+	androidCols    map[string]*collector.AndroidCollector
 	presentMonCols map[string]*collector.PresentMonCollector
 	engine         *gin.Engine
 }
@@ -26,6 +27,7 @@ func NewServer(database *db.DB) *Server {
 	s := &Server{
 		db:             database,
 		collectors:     make(map[string]*collector.Collector),
+		androidCols:    make(map[string]*collector.AndroidCollector),
 		presentMonCols: make(map[string]*collector.PresentMonCollector),
 	}
 
@@ -35,62 +37,53 @@ func NewServer(database *db.DB) *Server {
 		AllowOrigins:     []string{"*"},
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"*"},
-		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
 	}))
 
 	api := r.Group("/api")
 	{
-		// Session 管理
 		api.POST("/sessions", s.createSession)
 		api.GET("/sessions", s.listSessions)
 		api.GET("/sessions/:id", s.getSession)
 		api.POST("/sessions/:id/start", s.startCollect)
 		api.POST("/sessions/:id/stop", s.stopCollect)
 		api.DELETE("/sessions/:id", s.deleteSession)
-
-		// 数据查询
 		api.GET("/sessions/:id/samples", s.getSamples)
 		api.GET("/sessions/:id/summary", s.getSummary)
 		api.POST("/sessions/:id/samples", s.injectSample)
-
-		// 帧时间分析
 		api.GET("/sessions/:id/frame-analysis", s.getFrameAnalysis)
-
-		// 系统信息
 		api.GET("/sessions/:id/system", s.getSystemInfo)
-
-		// 对比
 		api.GET("/compare", s.compare)
-
-		// 运行时信息
 		api.GET("/info", s.getServerInfo)
+
+		// Android 专用
+		api.GET("/android/devices", s.listAndroidDevices)
+		api.GET("/android/packages", s.listAndroidPackages)
 	}
 
-	// 静态文件
 	r.Static("/assets", "./web/dist/assets")
-	r.NoRoute(func(c *gin.Context) {
-		c.File("./web/dist/index.html")
-	})
+	r.NoRoute(func(c *gin.Context) { c.File("./web/dist/index.html") })
 
 	s.engine = r
 	return s
 }
 
 func (s *Server) Run(addr string) error {
-	fmt.Printf("[server] 启动 http://%s\n", addr)
-	fmt.Printf("[server] OS=%s Arch=%s\n", runtime.GOOS, runtime.GOARCH)
+	fmt.Printf("[server] 启动 http://%s  OS=%s/%s\n", addr, runtime.GOOS, runtime.GOARCH)
 	return s.engine.Run(addr)
 }
 
-// --- handlers ---
+// --- Session CRUD ---
 
 func (s *Server) createSession(c *gin.Context) {
 	var req struct {
 		Name     string `json:"name"`
 		Process  string `json:"process"`
 		PID      int    `json:"pid"`
+		Platform string `json:"platform"`   // "windows" / "android"
+		Package  string `json:"package"`    // Android 包名
+		DeviceID string `json:"device_id"`  // Android 设备ID
 		Interval string `json:"interval"`
 		Tags     string `json:"tags"`
 	}
@@ -99,11 +92,19 @@ func (s *Server) createSession(c *gin.Context) {
 		return
 	}
 
+	platform := req.Platform
+	if platform == "" {
+		platform = "windows"
+	}
+
 	session := &model.Session{
 		ID:        generateID(),
 		Name:      req.Name,
 		Process:   req.Process,
 		PID:       int32(req.PID),
+		Platform:  platform,
+		Package:   req.Package,
+		DeviceID:  req.DeviceID,
 		Status:    "created",
 		StartTime: time.Now(),
 		Interval:  req.Interval,
@@ -114,7 +115,6 @@ func (s *Server) createSession(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-
 	c.JSON(http.StatusCreated, session)
 }
 
@@ -124,16 +124,14 @@ func (s *Server) listSessions(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	if sessions == nil {
-		sessions = []model.Session{}
-	}
+	if sessions == nil { sessions = []model.Session{} }
 	c.JSON(http.StatusOK, sessions)
 }
 
 func (s *Server) getSession(c *gin.Context) {
 	session, err := s.db.GetSession(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
 	c.JSON(http.StatusOK, session)
@@ -143,58 +141,86 @@ func (s *Server) startCollect(c *gin.Context) {
 	id := c.Param("id")
 	session, err := s.db.GetSession(id)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
 
 	var req struct {
-		PID             int    `json:"pid"`
-		Interval        string `json:"interval"`
-		PresentMonPath  string `json:"presentmon_path"`
-		EnablePresentMon bool  `json:"enable_presentmon"`
+		PID              int    `json:"pid"`
+		Interval         string `json:"interval"`
+		PresentMonPath   string `json:"presentmon_path"`
+		EnablePresentMon bool   `json:"enable_presentmon"`
+		// Android 专用
+		Package  string `json:"package"`
+		DeviceID string `json:"device_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	pid := int32(req.PID)
-	if pid == 0 {
-		pid = session.PID
-	}
-
 	interval := time.Second
 	if req.Interval != "" {
-		if d, err := time.ParseDuration(req.Interval); err == nil {
-			interval = d
+		if d, err := time.ParseDuration(req.Interval); err == nil { interval = d }
+	}
+
+	platform := session.Platform
+	if platform == "" {
+		// 兼容旧 session
+		if session.Package != "" || req.Package != "" {
+			platform = "android"
+		} else {
+			platform = "windows"
 		}
 	}
 
-	coll, err := collector.New(s.db, pid, interval)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
+	switch platform {
+	case "android":
+		pkg := session.Package
+		if pkg == "" { pkg = req.Package }
+		deviceID := session.DeviceID
+		if deviceID == "" { deviceID = req.DeviceID }
 
-	s.collectors[id] = coll
-	session.Status = "running"
-	session.PID = pid
-	session.Interval = req.Interval
-
-	// 启动性能采集
-	go coll.Start(id)
-
-	// 启动 PresentMon（可选）
-	if req.EnablePresentMon {
-		pmPath := req.PresentMonPath
-		if pmPath == "" {
-			pmPath, _ = collector.CheckPresentMon()
+		if pkg == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "package name required for android"})
+			return
 		}
-		if pmPath != "" {
-			pmColl, err := collector.NewPresentMonCollector(s.db, id, pid, pmPath)
-			if err == nil {
-				s.presentMonCols[id] = pmColl
-				go pmColl.StartPresentMon(pmPath)
+
+		ac := collector.NewAndroidCollector(s.db, pkg, deviceID, interval)
+		s.androidCols[id] = ac
+		session.Status = "running"
+		session.Package = pkg
+		session.DeviceID = deviceID
+
+		go func() {
+			if err := ac.Start(id); err != nil {
+				fmt.Printf("[android] 启动失败: %v\n", err)
+			}
+		}()
+
+	default: // windows / linux
+		pid := int32(req.PID)
+		if pid == 0 { pid = session.PID }
+
+		coll, err := collector.New(s.db, pid, interval)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		s.collectors[id] = coll
+		session.Status = "running"
+		session.PID = pid
+		session.Interval = req.Interval
+		go coll.Start(id)
+
+		if req.EnablePresentMon {
+			pmPath := req.PresentMonPath
+			if pmPath == "" { pmPath, _ = collector.CheckPresentMon() }
+			if pmPath != "" {
+				if pmColl, err := collector.NewPresentMonCollector(s.db, id, pid, pmPath); err == nil {
+					s.presentMonCols[id] = pmColl
+					go pmColl.StartPresentMon(pmPath)
+				}
 			}
 		}
 	}
@@ -204,137 +230,99 @@ func (s *Server) startCollect(c *gin.Context) {
 
 func (s *Server) stopCollect(c *gin.Context) {
 	id := c.Param("id")
-
-	if coll, ok := s.collectors[id]; ok {
-		coll.Stop()
-		delete(s.collectors, id)
-	}
-	if pm, ok := s.presentMonCols[id]; ok {
-		pm.Stop()
-		delete(s.presentMonCols, id)
-	}
-
-	if err := s.db.StopSession(id); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
+	if coll, ok := s.collectors[id]; ok { coll.Stop(); delete(s.collectors, id) }
+	if ac, ok := s.androidCols[id]; ok { ac.Stop(); delete(s.androidCols, id) }
+	if pm, ok := s.presentMonCols[id]; ok { pm.Stop(); delete(s.presentMonCols, id) }
+	s.db.StopSession(id)
 	c.JSON(http.StatusOK, gin.H{"status": "stopped"})
 }
 
 func (s *Server) deleteSession(c *gin.Context) {
 	id := c.Param("id")
-	if coll, ok := s.collectors[id]; ok {
-		coll.Stop()
-		delete(s.collectors, id)
-	}
-	if pm, ok := s.presentMonCols[id]; ok {
-		pm.Stop()
-		delete(s.presentMonCols, id)
-	}
-	if err := s.db.DeleteSession(id); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+	if coll, ok := s.collectors[id]; ok { coll.Stop(); delete(s.collectors, id) }
+	if ac, ok := s.androidCols[id]; ok { ac.Stop(); delete(s.androidCols, id) }
+	if pm, ok := s.presentMonCols[id]; ok { pm.Stop(); delete(s.presentMonCols, id) }
+	s.db.DeleteSession(id)
 	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
 }
 
 func (s *Server) getSamples(c *gin.Context) {
 	samples, err := s.db.GetSamples(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	if samples == nil {
-		samples = []model.Sample{}
-	}
+	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}); return }
+	if samples == nil { samples = []model.Sample{} }
 	c.JSON(http.StatusOK, samples)
 }
 
 func (s *Server) getSummary(c *gin.Context) {
 	summary, err := s.db.GetSummary(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}); return }
 	c.JSON(http.StatusOK, summary)
 }
 
-// injectSample 手动注入采样数据（用于 FPS 等无法自动采集的指标）
 func (s *Server) injectSample(c *gin.Context) {
 	id := c.Param("id")
 	var sample model.Sample
-	if err := c.ShouldBindJSON(&sample); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
+	if err := c.ShouldBindJSON(&sample); err != nil { c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()}); return }
 	sample.SessionID = id
-	if sample.Timestamp == 0 {
-		sample.Timestamp = time.Now().Unix()
-	}
-	if err := s.db.InsertSample(&sample); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+	if sample.Timestamp == 0 { sample.Timestamp = time.Now().Unix() }
+	if err := s.db.InsertSample(&sample); err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}); return }
 	c.JSON(http.StatusCreated, sample)
 }
 
 func (s *Server) getFrameAnalysis(c *gin.Context) {
 	analysis, err := s.db.GetFrameTimeAnalysis(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}); return }
 	c.JSON(http.StatusOK, analysis)
 }
 
 func (s *Server) getSystemInfo(c *gin.Context) {
 	info, err := s.db.GetSystemInfo(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "system info not found"})
-		return
-	}
+	if err != nil { c.JSON(http.StatusNotFound, gin.H{"error": "not found"}); return }
 	c.JSON(http.StatusOK, info)
 }
 
 func (s *Server) compare(c *gin.Context) {
-	idsStr := c.Query("ids")
-	if idsStr == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "ids parameter required"})
-		return
-	}
-
-	ids := strings.Split(idsStr, ",")
+	ids := strings.Split(c.Query("ids"), ",")
 	var result model.CompareResult
-
 	for _, id := range ids {
-		summary, err := s.db.GetSummary(strings.TrimSpace(id))
-		if err != nil {
-			continue
+		if summary, err := s.db.GetSummary(strings.TrimSpace(id)); err == nil {
+			result.Summaries = append(result.Summaries, *summary)
 		}
-		result.Summaries = append(result.Summaries, *summary)
 	}
-
 	c.JSON(http.StatusOK, result)
 }
 
 func (s *Server) getServerInfo(c *gin.Context) {
-	gpuStatus := "none"
-	pmStatus := "not available"
-
-	// 检查 nvidia-smi
-	if path, err := collector.New(s.db, 0, time.Second).CheckPresentMon(); err == nil {
-		_ = path
-	}
-	_ = gpuStatus
-	_ = pmStatus
-
 	c.JSON(http.StatusOK, gin.H{
 		"os":       runtime.GOOS,
 		"arch":     runtime.GOARCH,
-		"version":  "1.1.0",
-		"features": []string{"cpu", "memory", "threads", "disk_io", "network_io", "gpu_nvidia", "frametime", "jank_detection", "presentmon"},
+		"version":  "2.0.0",
+		"platforms": []string{"windows", "linux", "android"},
+		"features": []string{"cpu", "memory", "gpu_adreno", "gpu_mali", "gpu_nvidia", "fps", "frametime", "jank", "disk_io", "network_io", "battery", "thermal", "presentmon"},
 	})
+}
+
+// --- Android 专用 API ---
+
+func (s *Server) listAndroidDevices(c *gin.Context) {
+	devices, err := collector.ListAdbDevices()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "adb not available: " + err.Error()})
+		return
+	}
+	if devices == nil { devices = []string{} }
+	c.JSON(http.StatusOK, gin.H{"devices": devices})
+}
+
+func (s *Server) listAndroidPackages(c *gin.Context) {
+	deviceID := c.Query("device_id")
+	packages, err := collector.ListAndroidPackages(deviceID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if packages == nil { packages = []string{} }
+	c.JSON(http.StatusOK, gin.H{"packages": packages})
 }
 
 func generateID() string {

@@ -8,6 +8,9 @@ type Session struct {
 	Name      string     `json:"name"`       // 标签，如 "v1.0优化前"
 	Process   string     `json:"process"`    // 目标进程名/PID
 	PID       int32      `json:"pid"`        // 目标进程PID
+	Platform  string     `json:"platform"`   // windows / linux / android
+	Package   string     `json:"package"`    // Android 包名
+	DeviceID  string     `json:"device_id"`  // Android 设备序列号
 	Status    string     `json:"status"`     // running / stopped
 	StartTime time.Time  `json:"start_time"`
 	EndTime   *time.Time `json:"end_time,omitempty"`
@@ -74,6 +77,16 @@ type Sample struct {
 
 	// === 线程 ===
 	Threads       int32   `json:"threads"`          // 线程数
+
+	// === 电池 (Android) ===
+	BatteryLevel  float64 `json:"battery_level"`   // 电量%
+	BatteryTemp   float64 `json:"battery_temp"`    // 电池温度℃
+	BatteryPower  float64 `json:"battery_power"`   // 功耗mW
+	BatteryVoltage float64 `json:"battery_voltage"` // 电压mV
+	BatteryCurrent float64 `json:"battery_current"` // 电流mA
+
+	// === 温度 (Android) ===
+	CPUTemp       float64 `json:"cpu_temp"`        // CPU温度℃
 }
 
 // SessionSummary 会话统计摘要
@@ -138,6 +151,14 @@ type SessionSummary struct {
 	// 句柄/线程
 	MaxThreads     int32   `json:"max_threads"`
 	MaxHandleCount int32   `json:"max_handle_count"`
+
+	// 电池统计 (Android)
+	MinBatteryLevel float64 `json:"min_battery_level"`
+	MaxBatteryTemp  float64 `json:"max_battery_temp"`
+	AvgBatteryPower float64 `json:"avg_battery_power"`
+
+	// 温度统计 (Android)
+	MaxCPUTemp      float64 `json:"max_cpu_temp"`
 }
 
 // FrameTimeAnalysis 帧时间分布分析
@@ -178,13 +199,16 @@ type CompareResult struct {
 
 // SystemInfo 系统信息（采集开始时记录一次）
 type SystemInfo struct {
-	SessionID   string `json:"session_id"`
-	OS          string `json:"os"`
-	Arch        string `json:"arch"`
-	CPUModel    string `json:"cpu_model"`
-	CPUCores    int    `json:"cpu_cores"`
-	TotalMemory int64  `json:"total_memory"` // MB
-	GPUName     string `json:"gpu_name"`
-	GPUDriver   string `json:"gpu_driver"`
-	GPUVRAM     int64  `json:"gpu_vram"`     // MB
+	SessionID     string `json:"session_id"`
+	OS            string `json:"os"`
+	Arch          string `json:"arch"`
+	CPUModel      string `json:"cpu_model"`
+	CPUCores      int    `json:"cpu_cores"`
+	TotalMemory   int64  `json:"total_memory"` // MB
+	GPUName       string `json:"gpu_name"`
+	GPUDriver     string `json:"gpu_driver"`
+	GPUVRAM       int64  `json:"gpu_vram"`     // MB
+	DeviceModel   string `json:"device_model"`   // Android 设备型号
+	AndroidVersion string `json:"android_version"` // e.g. "14"
+	AndroidAPI    int    `json:"android_api"`     // e.g. 34
 }
