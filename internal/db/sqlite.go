@@ -112,10 +112,12 @@ func (d *DB) migrate() error {
 			gpu_driver TEXT NOT NULL DEFAULT '',
 			gpu_vram INTEGER NOT NULL DEFAULT 0,
 			device_model TEXT NOT NULL DEFAULT '',
-			android_version TEXT NOT NULL DEFAULT '',
+			os_version TEXT NOT NULL DEFAULT '',
 			android_api INTEGER NOT NULL DEFAULT 0
 		);
 	`)
+	// Migration: rename android_version -> os_version (for existing databases)
+	d.conn.Exec(`ALTER TABLE system_info RENAME COLUMN android_version TO os_version`)
 	return err
 }
 
@@ -171,21 +173,39 @@ func (d *DB) StopSession(id string) error {
 	return err
 }
 
-func (d *DB) DeleteSession(id string) error {
-	d.conn.Exec(`DELETE FROM samples WHERE session_id = ?`, id)
-	d.conn.Exec(`DELETE FROM system_info WHERE session_id = ?`, id)
-	_, err := d.conn.Exec(`DELETE FROM sessions WHERE id = ?`, id)
+func (d *DB) SetSessionStatus(id string, status string) error {
+	_, err := d.conn.Exec(`UPDATE sessions SET status = ? WHERE id = ?`, status, id)
 	return err
+}
+
+func (d *DB) DeleteSession(id string) error {
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM samples WHERE session_id = ?`, id); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("delete samples: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM system_info WHERE session_id = ?`, id); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("delete system_info: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM sessions WHERE id = ?`, id); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("delete session: %w", err)
+	}
+	return tx.Commit()
 }
 
 // --- SystemInfo ---
 
 func (d *DB) SaveSystemInfo(info *model.SystemInfo) error {
 	_, err := d.conn.Exec(
-		`INSERT OR REPLACE INTO system_info (session_id, os, arch, cpu_model, cpu_cores, total_memory, gpu_name, gpu_driver, gpu_vram, device_model, android_version, android_api)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT OR REPLACE INTO system_info (session_id, os, arch, cpu_model, cpu_cores, total_memory, gpu_name, gpu_driver, gpu_vram, device_model, os_version, android_api)
+	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		info.SessionID, info.OS, info.Arch, info.CPUModel, info.CPUCores, info.TotalMemory, info.GPUName, info.GPUDriver, info.GPUVRAM,
-		info.DeviceModel, info.AndroidVersion, info.AndroidAPI,
+		info.DeviceModel, info.OSVersion, info.AndroidAPI,
 	)
 	return err
 }
@@ -193,9 +213,9 @@ func (d *DB) SaveSystemInfo(info *model.SystemInfo) error {
 func (d *DB) GetSystemInfo(sessionID string) (*model.SystemInfo, error) {
 	var info model.SystemInfo
 	err := d.conn.QueryRow(
-		`SELECT session_id, os, arch, cpu_model, cpu_cores, total_memory, gpu_name, gpu_driver, gpu_vram, device_model, android_version, android_api FROM system_info WHERE session_id = ?`, sessionID,
+		`SELECT session_id, os, arch, cpu_model, cpu_cores, total_memory, gpu_name, gpu_driver, gpu_vram, device_model, os_version, android_api FROM system_info WHERE session_id = ?`, sessionID,
 	).Scan(&info.SessionID, &info.OS, &info.Arch, &info.CPUModel, &info.CPUCores, &info.TotalMemory, &info.GPUName, &info.GPUDriver, &info.GPUVRAM,
-		&info.DeviceModel, &info.AndroidVersion, &info.AndroidAPI)
+		&info.DeviceModel, &info.OSVersion, &info.AndroidAPI)
 	if err != nil {
 		return nil, err
 	}
@@ -262,8 +282,14 @@ func scanSample(rows *sql.Rows) (*model.Sample, error) {
 	return &s, err
 }
 
-func (d *DB) GetSamples(sessionID string) ([]model.Sample, error) {
-	rows, err := d.conn.Query(sampleSelect+` WHERE session_id = ? ORDER BY timestamp`, sessionID)
+func (d *DB) GetSamples(sessionID string, limit int, offset int) ([]model.Sample, error) {
+	if limit <= 0 {
+		limit = 5000
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := d.conn.Query(sampleSelect+` WHERE session_id = ? ORDER BY timestamp LIMIT ? OFFSET ?`, sessionID, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +312,7 @@ func (d *DB) GetSummary(sessionID string) (*model.SessionSummary, error) {
 	if err != nil {
 		return nil, err
 	}
-	samples, err := d.GetSamples(sessionID)
+	samples, err := d.GetSamples(sessionID, 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -371,7 +397,7 @@ func (d *DB) GetSummary(sessionID string) (*model.SessionSummary, error) {
 
 // GetFrameTimeAnalysis 帧时间分布分析（复用不变）
 func (d *DB) GetFrameTimeAnalysis(sessionID string) (*model.FrameTimeAnalysis, error) {
-	samples, err := d.GetSamples(sessionID)
+	samples, err := d.GetSamples(sessionID, 0, 0)
 	if err != nil {
 		return nil, err
 	}

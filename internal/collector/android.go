@@ -129,7 +129,7 @@ func (ac *AndroidCollector) collectSystemInfo() *model.SystemInfo {
 	}
 	// Android 版本
 	if ver, _ := ac.adb("shell", "getprop", "ro.build.version.release"); ver != "" {
-		info.AndroidVersion = ver
+		info.OSVersion = ver
 	}
 	// API level
 	if api, _ := ac.adb("shell", "getprop", "ro.build.version.sdk"); api != "" {
@@ -196,7 +196,9 @@ func (ac *AndroidCollector) Start(sessionID string) error {
 	}
 	sysInfo := ac.collectSystemInfo()
 	sysInfo.SessionID = sessionID
-	ac.database.SaveSystemInfo(sysInfo)
+	if err := ac.database.SaveSystemInfo(sysInfo); err != nil {
+		fmt.Printf("[android] 保存系统信息失败: %v\n", err)
+	}
 
 	startUnix := session.StartTime.Unix()
 	ticker := time.NewTicker(ac.interval)

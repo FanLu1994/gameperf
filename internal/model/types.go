@@ -209,6 +209,6 @@ type SystemInfo struct {
 	GPUDriver     string `json:"gpu_driver"`
 	GPUVRAM       int64  `json:"gpu_vram"`     // MB
 	DeviceModel   string `json:"device_model"`   // Android 设备型号
-	AndroidVersion string `json:"android_version"` // e.g. "14"
+	OSVersion      string `json:"os_version"`      // e.g. "14" (Android) or "17.2" (iOS)
 	AndroidAPI    int    `json:"android_api"`     // e.g. 34
 }

@@ -125,9 +125,9 @@ func (ic *IOSCollector) collectSystemInfo() *model.SystemInfo {
 					if name, ok := d["DeviceName"].(string); ok {
 						info.DeviceModel = name
 					}
-					if ver, ok := d["ProductVersion"].(string); ok {
-						info.AndroidVersion = ver // 复用字段存 iOS 版本
-					}
+				if ver, ok := d["ProductVersion"].(string); ok {
+					info.OSVersion = ver
+				}
 					if product, ok := d["ProductType"].(string); ok {
 						if info.DeviceModel == "" {
 							info.DeviceModel = product
@@ -166,7 +166,9 @@ func (ic *IOSCollector) Start(sessionID string) error {
 	// 保存系统信息
 	sysInfo := ic.collectSystemInfo()
 	sysInfo.SessionID = sessionID
-	ic.database.SaveSystemInfo(sysInfo)
+	if err := ic.database.SaveSystemInfo(sysInfo); err != nil {
+		fmt.Printf("[ios] 保存系统信息失败: %v\n", err)
+	}
 
 	startUnix := session.StartTime.Unix()
 	ticker := time.NewTicker(ic.interval)
@@ -347,33 +349,15 @@ func (ic *IOSCollector) collectBattery(sample *model.Sample) {
 
 // collectFPS 采集 FPS — 通过 tidevice perf (如果可用)
 func (ic *IOSCollector) collectFPS(sample *model.Sample) {
-	// 方案1: 尝试 tidevice perf (iOS <=16 更可靠)
-	args := []string{"perf", "-B", ic.bundleID, "--json"}
-	if ic.deviceUDID != "" {
-		args = append([]string{"-u", ic.deviceUDID}, args...)
-	}
-	cmd := exec.Command("tidevice", args...)
-	// 超时控制 — tidevice perf 会持续输出，用 timeout 截断
-	if out, err := exec.Command("timeout", "3").Output(); err == nil {
-		_ = out
-	}
-	// 改用更安全的方式：只读一行
-	done := make(chan struct{})
-	go func() {
-		close(done)
-	}()
-	_ = done
-
-	// 简化：直接用 sysmon graphics instrument
-	// pymobiledevice3 developer dvt sysmon process single 已包含 fps 字段 (部分版本)
-	// 如果上面 process snapshot 中 fps 字段 > 0，直接用
-	if sample.FPS > 0 {
-		return
-	}
-
-	// 方案2: 通过 CoreAnimation FPS — 需要指定 graphics 模板
-	// 这部分在 pymobiledevice3 中需要更复杂的 DTX 交互
-	// MVP 阶段暂时标记 FPS 为手动注入
+	// TODO: iOS FPS collection via tidevice perf or pymobiledevice3 DVT instruments
+	// is not yet implemented. The previous code had dead/orphaned logic that never
+	// actually captured FPS data. To implement this properly:
+	//
+	// 1. Launch `tidevice -u <udid> perf -B <bundleID> --json` as a persistent subprocess
+	// 2. Parse its JSON output line-by-line for the "FPS" field
+	// 3. Or use pymobiledevice3 developer dvt sysmon with a graphics template
+	//
+	// For now, FPS must be injected manually via API or the InjectFrameData helper.
 }
 
 // collectNetwork 系统级网络统计

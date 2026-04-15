@@ -9,9 +9,11 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/shirou/gopsutil/v3/net"
 	"github.com/shirou/gopsutil/v3/process"
 
@@ -89,7 +91,9 @@ func (c *Collector) Start(sessionID string) error {
 	// 采集系统信息并保存
 	sysInfo := c.collectSystemInfo()
 	sysInfo.SessionID = sessionID
-	c.database.SaveSystemInfo(sysInfo)
+	if err := c.database.SaveSystemInfo(sysInfo); err != nil {
+		fmt.Printf("[collector] 保存系统信息失败: %v\n", err)
+	}
 
 	startUnix := session.StartTime.Unix()
 	ticker := time.NewTicker(c.interval)
@@ -286,10 +290,9 @@ func (c *Collector) collectSystemInfo() *model.SystemInfo {
 		info.CPUCores = cores
 	}
 
-	// 内存
-	if mem, err := c.proc.MemoryInfo(); err == nil {
-		// 使用系统内存总量 — 通过 /proc/meminfo 或全局
-		info.TotalMemory = int64(float64(mem.RSS) / 1024 / 1024) // 近似
+	// 内存 — 使用系统总内存
+	if vm, err := mem.VirtualMemory(); err == nil {
+		info.TotalMemory = int64(vm.Total / 1024 / 1024) // bytes -> MB
 	}
 
 	// GPU — nvidia-smi
@@ -342,6 +345,8 @@ type PresentMonCollector struct {
 	cmd       *exec.Cmd
 	pid       int32
 	stopCh    chan struct{}
+	stopOnce  sync.Once
+	startTime time.Time
 }
 
 func NewPresentMonCollector(database *db.DB, sessionID string, pid int32, presentMonPath string) (*PresentMonCollector, error) {
@@ -355,6 +360,8 @@ func NewPresentMonCollector(database *db.DB, sessionID string, pid int32, presen
 
 // StartPresentMon 启动 PresentMon 进程并解析输出
 func (pm *PresentMonCollector) StartPresentMon(presentMonPath string) error {
+	pm.startTime = time.Now()
+
 	// PresentMon 输出 CSV 到 stdout
 	pm.cmd = exec.Command(presentMonPath,
 		"-captureno",
@@ -441,24 +448,42 @@ func (pm *PresentMonCollector) parseCSV(reader io.Reader) {
 			}
 		}
 
-		// 注入到最近的采样中（通过 API）
-		_ = fps
-		_ = fps1Low
-		_ = fps01Low
-		_ = jankCount
-		_ = stutterFrames
-		_ = totalFrames
-		_ = isJank
+		// 写入帧数据到数据库
+		now := time.Now().Unix()
+		jankVal := int32(0)
+		if isJank {
+			jankVal = 1
+		}
+		stutterRate := 0.0
+		if totalFrames > 0 {
+			stutterRate = float64(stutterFrames) / float64(totalFrames) * 100
+		}
+		sample := &model.Sample{
+			SessionID:   pm.sessionID,
+			Timestamp:   now,
+			Elapsed:     time.Since(pm.startTime).Seconds(),
+			FPS:         fps,
+			FrameTime:   frameTime,
+			FPS1Low:     fps1Low,
+			FPS01Low:    fps01Low,
+			JankCount:   jankVal,
+			StutterRate: stutterRate,
+		}
+		if err := pm.database.InsertSample(sample); err != nil {
+			fmt.Printf("[presentmon] 写入失败: %v\n", err)
+		}
 
 		prevFrameTime = frameTime
 	}
 }
 
 func (pm *PresentMonCollector) Stop() {
-	if pm.cmd != nil && pm.cmd.Process != nil {
-		pm.cmd.Process.Kill()
-	}
-	close(pm.stopCh)
+	pm.stopOnce.Do(func() {
+		if pm.cmd != nil && pm.cmd.Process != nil {
+			pm.cmd.Process.Kill()
+		}
+		close(pm.stopCh)
+	})
 }
 
 // InjectFrameData 手动注入帧数据（供外部调用或 API 使用）

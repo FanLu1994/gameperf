@@ -1,10 +1,14 @@
 package api
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -16,6 +20,7 @@ import (
 )
 
 type Server struct {
+	mu             sync.RWMutex
 	db             *db.DB
 	collectors     map[string]*collector.Collector
 	androidCols    map[string]*collector.AndroidCollector
@@ -36,11 +41,10 @@ func NewServer(database *db.DB) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"*"},
-		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"*"},
-		AllowCredentials: true,
-		MaxAge:           12 * time.Hour,
+		AllowOrigins: []string{"*"},
+		AllowMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowHeaders: []string{"*"},
+		MaxAge:       12 * time.Hour,
 	}))
 
 	api := r.Group("/api")
@@ -143,6 +147,13 @@ func (s *Server) getSession(c *gin.Context) {
 	c.JSON(http.StatusOK, session)
 }
 
+// onCollectorError is a callback invoked when a collector goroutine fails.
+// It updates the session status to "error" in the database.
+func (s *Server) onCollectorError(sessionID string, err error) {
+	fmt.Printf("[collector] session %s failed: %v\n", sessionID, err)
+	s.db.SetSessionStatus(sessionID, "error")
+}
+
 func (s *Server) startCollect(c *gin.Context) {
 	id := c.Param("id")
 	session, err := s.db.GetSession(id)
@@ -193,14 +204,16 @@ func (s *Server) startCollect(c *gin.Context) {
 		}
 
 		ac := collector.NewAndroidCollector(s.db, pkg, deviceID, interval)
+		s.mu.Lock()
 		s.androidCols[id] = ac
+		s.mu.Unlock()
 		session.Status = "running"
 		session.Package = pkg
 		session.DeviceID = deviceID
 
 		go func() {
 			if err := ac.Start(id); err != nil {
-				fmt.Printf("[android] 启动失败: %v\n", err)
+				s.onCollectorError(id, err)
 			}
 		}()
 
@@ -216,14 +229,16 @@ func (s *Server) startCollect(c *gin.Context) {
 		}
 
 		ic := collector.NewIOSCollector(s.db, bundle, udid, interval)
+		s.mu.Lock()
 		s.iosCols[id] = ic
+		s.mu.Unlock()
 		session.Status = "running"
 		session.Package = bundle
 		session.DeviceID = udid
 
 		go func() {
 			if err := ic.Start(id); err != nil {
-				fmt.Printf("[ios] 启动失败: %v\n", err)
+				s.onCollectorError(id, err)
 			}
 		}()
 
@@ -236,19 +251,29 @@ func (s *Server) startCollect(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
+		s.mu.Lock()
 		s.collectors[id] = coll
+		s.mu.Unlock()
 		session.Status = "running"
 		session.PID = pid
 		session.Interval = req.Interval
-		go coll.Start(id)
+		go func() {
+			coll.Start(id)
+		}()
 
 		if req.EnablePresentMon {
 			pmPath := req.PresentMonPath
 			if pmPath == "" { pmPath, _ = collector.CheckPresentMon() }
 			if pmPath != "" {
 				if pmColl, err := collector.NewPresentMonCollector(s.db, id, pid, pmPath); err == nil {
+					s.mu.Lock()
 					s.presentMonCols[id] = pmColl
-					go pmColl.StartPresentMon(pmPath)
+					s.mu.Unlock()
+					go func() {
+						if err := pmColl.StartPresentMon(pmPath); err != nil {
+							s.onCollectorError(id, err)
+						}
+					}()
 				}
 			}
 		}
@@ -259,26 +284,38 @@ func (s *Server) startCollect(c *gin.Context) {
 
 func (s *Server) stopCollect(c *gin.Context) {
 	id := c.Param("id")
+	s.mu.Lock()
 	if coll, ok := s.collectors[id]; ok { coll.Stop(); delete(s.collectors, id) }
 	if ac, ok := s.androidCols[id]; ok { ac.Stop(); delete(s.androidCols, id) }
 	if ic, ok := s.iosCols[id]; ok { ic.Stop(); delete(s.iosCols, id) }
 	if pm, ok := s.presentMonCols[id]; ok { pm.Stop(); delete(s.presentMonCols, id) }
+	s.mu.Unlock()
 	s.db.StopSession(id)
 	c.JSON(http.StatusOK, gin.H{"status": "stopped"})
 }
 
 func (s *Server) deleteSession(c *gin.Context) {
 	id := c.Param("id")
+	s.mu.Lock()
 	if coll, ok := s.collectors[id]; ok { coll.Stop(); delete(s.collectors, id) }
 	if ac, ok := s.androidCols[id]; ok { ac.Stop(); delete(s.androidCols, id) }
 	if ic, ok := s.iosCols[id]; ok { ic.Stop(); delete(s.iosCols, id) }
 	if pm, ok := s.presentMonCols[id]; ok { pm.Stop(); delete(s.presentMonCols, id) }
+	s.mu.Unlock()
 	s.db.DeleteSession(id)
 	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
 }
 
 func (s *Server) getSamples(c *gin.Context) {
-	samples, err := s.db.GetSamples(c.Param("id"))
+	limit := 5000
+	offset := 0
+	if l, err := strconv.Atoi(c.Query("limit")); err == nil && l > 0 {
+		limit = l
+	}
+	if o, err := strconv.Atoi(c.Query("offset")); err == nil && o >= 0 {
+		offset = o
+	}
+	samples, err := s.db.GetSamples(c.Param("id"), limit, offset)
 	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}); return }
 	if samples == nil { samples = []model.Sample{} }
 	c.JSON(http.StatusOK, samples)
@@ -314,6 +351,10 @@ func (s *Server) getSystemInfo(c *gin.Context) {
 
 func (s *Server) compare(c *gin.Context) {
 	ids := strings.Split(c.Query("ids"), ",")
+	if len(ids) > 10 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "maximum 10 IDs allowed for comparison"})
+		return
+	}
 	var result model.CompareResult
 	for _, id := range ids {
 		if summary, err := s.db.GetSummary(strings.TrimSpace(id)); err == nil {
@@ -389,5 +430,10 @@ func (s *Server) checkIOSPrereqs(c *gin.Context) {
 }
 
 func generateID() string {
-	return fmt.Sprintf("%d", time.Now().UnixNano())
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback should never happen with crypto/rand
+		panic("crypto/rand failed: " + err.Error())
+	}
+	return hex.EncodeToString(b)
 }
