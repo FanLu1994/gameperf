@@ -181,7 +181,7 @@ func (ic *IOSCollector) Start(sessionID string) error {
 		case <-ic.stopCh:
 			fmt.Printf("[ios] 停止采集 session=%s\n", sessionID)
 			return nil
-		case t := <-ticker.T:
+		case t := <-ticker.C:
 			sample := ic.collect(t.Unix(), startUnix)
 			sample.SessionID = sessionID
 			if err := ic.database.InsertSample(sample); err != nil {

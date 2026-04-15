@@ -214,7 +214,7 @@ func (ac *AndroidCollector) Start(sessionID string) error {
 		case <-ac.stopCh:
 			fmt.Printf("[android] 停止采集 session=%s\n", sessionID)
 			return nil
-		case t := <-ticker.T:
+		case t := <-ticker.C:
 			sample := ac.collect(t.Unix(), startUnix)
 			sample.SessionID = sessionID
 			if err := ac.database.InsertSample(sample); err != nil {
@@ -460,7 +460,7 @@ func (ac *AndroidCollector) collectFPS(sample *model.Sample) {
 	}
 
 	// Jank 检测: 帧时间 > 前一帧 * 2
-	for i := 2; i < len(frameTimestamps) && i < len(frameTimestamps); i++ {
+	for i := 2; i < len(frameTimestamps); i++ {
 		prev := frameTimestamps[i-1] - frameTimestamps[i-2]
 		curr := frameTimestamps[i] - frameTimestamps[i-1]
 		if prev > 0 && curr > prev*2 {

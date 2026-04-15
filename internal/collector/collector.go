@@ -127,7 +127,7 @@ func (c *Collector) collect(now, startUnix int64) *model.Sample {
 	}
 
 	// === CPU ===
-	if cpuPercent, err := c.proc.CPPercent(0); err == nil {
+	if cpuPercent, err := c.proc.Percent(0); err == nil {
 		sample.CPU = cpuPercent
 	}
 
@@ -151,7 +151,7 @@ func (c *Collector) collect(now, startUnix int64) *model.Sample {
 	if memInfo, err := c.proc.MemoryInfo(); err == nil {
 		sample.Memory = float64(memInfo.RSS) / 1024 / 1024
 		sample.MemoryVMS = float64(memInfo.VMS) / 1024 / 1024
-		sample.PageFaults = int64(memInfo.PageFaults)
+		// PageFaults not available in gopsutil v3
 	}
 
 	// 句柄数 / FD 数
@@ -279,7 +279,7 @@ func (c *Collector) collectGPUViaNvidiaSmi(sample *model.Sample) {
 func (c *Collector) collectSystemInfo() *model.SystemInfo {
 	info := &model.SystemInfo{
 		OS:   runtime.GOOS,
-		Arch: runtime.Arch,
+		Arch: runtime.GOARCH,
 	}
 
 	// CPU 信息
